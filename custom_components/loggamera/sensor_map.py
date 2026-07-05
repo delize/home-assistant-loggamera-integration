@@ -171,7 +171,12 @@ SENSOR_MAP: Dict[str, Dict[str, Any]] = {
     "filterAlarmIsActive": _label("Filter Alarm", "mdi:air-filter"),
     # HeatMeter RawData sensors
     "544310": _energy_total("Total Energy"),
-    "544311": _measurement("Total Volume", UnitOfVolume.CUBIC_METERS),
+    "544311": {
+        "device_class": None,
+        "unit": UnitOfVolume.CUBIC_METERS,
+        "state_class": SensorStateClass.TOTAL_INCREASING,
+        "name": "Total Volume",
+    },
     "544320": _measurement("Flow Rate", "m³/h"),
     "544321": _temp("Flow Temperature"),
     "544322": _temp("Return Temperature"),
@@ -208,7 +213,12 @@ SENSOR_MAP: Dict[str, Dict[str, Any]] = {
     "543838": _measurement("Spreading Factor", None, "mdi:radio-tower"),
     "543837": _measurement("Signal to Noise Ratio", "dB", "mdi:signal"),
     # WaterMeter RawData
-    "422568": _measurement("Meter Value", UnitOfVolume.CUBIC_METERS),  # not classed as WATER
+    "422568": {  # not classed as WATER
+        "device_class": None,
+        "unit": UnitOfVolume.CUBIC_METERS,
+        "state_class": SensorStateClass.TOTAL_INCREASING,
+        "name": "Meter Value",
+    },
     "542175": _water_total("Consumption Since Midnight", UnitOfVolume.LITERS),
     "542176": _measurement("Current Flow", "L/min"),
     "544316": _water_total("Consumption Interval", UnitOfVolume.LITERS),
