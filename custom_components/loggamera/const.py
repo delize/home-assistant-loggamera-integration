@@ -13,30 +13,20 @@ API_ENDPOINT_WATER_METER = "WaterMeter"
 API_ENDPOINT_COOLING_UNIT = "CoolingUnit"
 API_ENDPOINT_HEAT_PUMP = "HeatPump"
 API_ENDPOINT_RAW_DATA = "RawData"
-API_ENDPOINT_CAPABILITIES = "Capabilities"
 API_ENDPOINT_SCENARIOS = "Scenarios"
 API_ENDPOINT_EXECUTE_SCENARIO_ASYNC = "ExecuteScenarioAsync"
-API_ENDPOINT_USER_ACCESS = "UserAccess"
 
-# Configuration
+# Configuration keys
 CONF_API_KEY = "api_key"
 CONF_ORGANIZATION_ID = "organization_id"
 CONF_SCAN_INTERVAL = "scan_interval"
 
-# Default 20 minutes (1200 seconds) - optimized for PowerMeter which typically updates every ~30 minutes  # noqa: E501
+# Default 20 minutes — PowerMeter typically updates every ~30 minutes upstream
 DEFAULT_SCAN_INTERVAL = 1200
 
 # Attributes
 ATTR_DEVICE_TYPE = "device_type"
 ATTR_DURATION_MINUTES = "duration_minutes"
 
-# Sensor types for internal use
-SENSOR_TEMPERATURE = "temperature"
-SENSOR_HUMIDITY = "humidity"
-SENSOR_ENERGY = "energy"
-SENSOR_POWER = "power"
-SENSOR_WATER = "water"
-SENSOR_VALUE = "value"
-
-# Platform definitions
+# Platforms loaded by this integration
 PLATFORMS = ["sensor", "binary_sensor", "switch"]

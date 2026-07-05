@@ -13,8 +13,7 @@
   "issue_tracker": "https://github.com/delize/home-assistant-loggamera-integration/issues",
   "requirements": [
     "requests>=2.25.0",
-    "certifi>=2025.04.26",
-    "aiofiles>=0.8.0"
+    "certifi>=2025.04.26"
   ],
   "ssdp": [],
   "version": "0.9.5",

@@ -1,12 +1,8 @@
 """API client for Loggamera."""
 
-import asyncio
 import logging
-import platform
-import ssl
-import sys
 import time
-from datetime import datetime  # noqa: F401
+from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, Optional, Union
 
@@ -14,7 +10,6 @@ import certifi
 import requests
 
 from .const import (
-    API_ENDPOINT_CAPABILITIES,
     API_ENDPOINT_COOLING_UNIT,
     API_ENDPOINT_DEVICES,
     API_ENDPOINT_EXECUTE_SCENARIO_ASYNC,
@@ -25,777 +20,326 @@ from .const import (
     API_ENDPOINT_RAW_DATA,
     API_ENDPOINT_ROOM_SENSOR,
     API_ENDPOINT_SCENARIOS,
-    API_ENDPOINT_USER_ACCESS,
     API_ENDPOINT_WATER_METER,
     API_URL,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
+# Map device class -> dedicated endpoint. Devices not listed here fall through
+# to the generic fallback chain (RawData, GenericDevice).
+PRIMARY_ENDPOINTS = {
+    "PowerMeter": API_ENDPOINT_POWER_METER,
+    "RoomSensor": API_ENDPOINT_ROOM_SENSOR,
+    "WaterMeter": API_ENDPOINT_WATER_METER,
+    "CoolingUnit": API_ENDPOINT_COOLING_UNIT,
+    "HeatPump": API_ENDPOINT_HEAT_PUMP,
+}
+
+FALLBACK_ENDPOINTS = [API_ENDPOINT_RAW_DATA, API_ENDPOINT_GENERIC_DEVICE]
+
+# Retry behavior
+MAX_RETRIES = 3
+BACKOFF_DELAYS = [15, 30, 60]
+RETRYABLE_STATUS_CODES = {429, *range(500, 600)}
+
 
 class LoggameraAPIError(Exception):
     """Exception for Loggamera API errors."""
 
-    pass
-
 
 class ErrorType(Enum):
-    """Classification of different error types for retry strategies."""
+    """Classification used to decide retry behavior."""
 
-    NETWORK = "network"  # Network connectivity issues - retry with backoff
-    HTTP_ERROR = "http_error"  # HTTP errors (4xx, 5xx) - limited retries
-    API_ERROR = "api_error"  # API-specific errors - no retry
-    TIMEOUT = "timeout"  # Request timeout - retry with backoff
-    INVALID_ENDPOINT = "invalid_endpoint"  # Invalid endpoint - no retry
+    NETWORK = "network"
+    HTTP_RETRYABLE = "http_retryable"
+    HTTP_CLIENT = "http_client"
+    TIMEOUT = "timeout"
+    INVALID_ENDPOINT = "invalid_endpoint"
+    API_ERROR = "api_error"
+
+
+RETRYABLE_ERRORS = {ErrorType.NETWORK, ErrorType.TIMEOUT, ErrorType.HTTP_RETRYABLE}
 
 
 class CircuitBreaker:
-    """Circuit breaker to prevent hitting failing endpoints repeatedly."""
+    """Trip after `failure_threshold` failures; recover after `timeout` seconds."""
 
     def __init__(self, failure_threshold: int = 6, timeout: int = 300):
-        """Initialize circuit breaker.
-
-        Args:
-            failure_threshold: Number of failures before opening circuit
-            timeout: Time in seconds to wait before trying again
-        """
         self.failure_threshold = failure_threshold
         self.timeout = timeout
         self.failure_count = 0
-        self.last_failure_time = 0
-        self.state = "closed"  # closed, open, half_open
+        self.last_failure_time = 0.0
+        self.state = "closed"  # closed | open | half_open
 
     def is_open(self) -> bool:
-        """Check if circuit is open (should block requests)."""
-        if self.state == "open":
-            if time.time() - self.last_failure_time > self.timeout:
-                self.state = "half_open"
-                _LOGGER.debug("Circuit breaker moving to half-open state")
-                return False
-            return True
-        return False
+        if self.state != "open":
+            return False
+        if time.time() - self.last_failure_time > self.timeout:
+            self.state = "half_open"
+            return False
+        return True
 
-    def record_success(self):
-        """Record successful request."""
+    def record_success(self) -> None:
         self.failure_count = 0
-        if self.state == "half_open":
-            self.state = "closed"
-            _LOGGER.debug("Circuit breaker closed after successful request")
+        self.state = "closed"
 
-    def record_failure(self):
-        """Record failed request."""
+    def record_failure(self) -> None:
         self.failure_count += 1
         self.last_failure_time = time.time()
-
         if self.failure_count >= self.failure_threshold:
             self.state = "open"
             _LOGGER.warning(
-                f"Circuit breaker opened after {self.failure_count} failures. "
-                f"Will retry in {self.timeout} seconds"
+                f"Circuit breaker opened after {self.failure_count} failures; "
+                f"will retry in {self.timeout}s"
             )
 
 
-class RetryConfig:
-    """Configuration for retry behavior."""
+def _classify_error(exception: Exception) -> ErrorType:
+    """Map an exception to a retry-decision category."""
+    if isinstance(exception, requests.exceptions.Timeout):
+        return ErrorType.TIMEOUT
+    if isinstance(exception, requests.exceptions.ConnectionError):
+        return ErrorType.NETWORK
+    if isinstance(exception, LoggameraAPIError):
+        if "invalid endpoint" in str(exception).lower():
+            return ErrorType.INVALID_ENDPOINT
+        return ErrorType.API_ERROR
+    return ErrorType.NETWORK
 
-    def __init__(self):
-        self.max_retries = 3
-        self.backoff_delays = [15, 30, 60]  # seconds
-        self.retryable_errors = {
-            ErrorType.NETWORK,
-            ErrorType.TIMEOUT,
-            ErrorType.HTTP_ERROR,  # Some HTTP errors may be retryable
-        }
 
-    def should_retry(self, error_type: ErrorType, attempt: int) -> bool:
-        """Determine if we should retry based on error type and attempt number."""
-        if attempt >= self.max_retries:
-            return False
-        return error_type in self.retryable_errors
-
-    def get_delay(self, attempt: int) -> int:
-        """Get delay for given attempt (0-based)."""
-        if attempt < len(self.backoff_delays):
-            return self.backoff_delays[attempt]
-        return self.backoff_delays[-1]  # Use last delay for any additional attempts
+def _is_invalid_endpoint_response(result: Dict[str, Any]) -> bool:
+    """Check whether an API response indicates the endpoint isn't valid for this caller."""
+    error = result.get("Error")
+    return isinstance(error, dict) and error.get("Message") == "invalid endpoint"
 
 
 class LoggameraAPI:
     """API client for Loggamera.
 
-    Note on update frequency:
-    The PowerMeter endpoint typically updates data approximately every 30 minutes.
-    Setting a more frequent polling interval will not result in more data updates.
+    The PowerMeter endpoint typically updates every ~30 minutes upstream;
+    polling more frequently does not yield more data.
     """
 
     def __init__(self, api_key: str, organization_id: Optional[Union[str, int]] = None) -> None:
-        """Initialize API client.
-
-        Args:
-            api_key: The API key for authentication
-            organization_id: Optional organization ID for device/scenario access
-        """
         self.api_key = api_key
         self.organization_id = organization_id
         self.session = requests.Session()
         self.session.verify = certifi.where()
 
-        # Cache for endpoint availability
-        self._endpoint_cache = {}
+        self._endpoint_cache: Dict[str, bool] = {}
+        self._data_gap_tracker: Dict[str, Dict[str, Any]] = {}
+        self._circuit_breakers: Dict[str, CircuitBreaker] = {}
 
-        # Keep track of last data timestamp to log changes
-        self._last_data_timestamp = {}
+    def _circuit_breaker(self, endpoint: str) -> CircuitBreaker:
+        if endpoint not in self._circuit_breakers:
+            self._circuit_breakers[endpoint] = CircuitBreaker()
+        return self._circuit_breakers[endpoint]
 
-        # Track data gaps for enhanced reporting
-        self._data_gap_tracker = {}  # device_id -> {gap_start, gap_count, last_successful}
-
-        # Retry and circuit breaker configuration
-        self.retry_config = RetryConfig()
-        self.circuit_breakers = {}  # Per-endpoint circuit breakers
-
-        # Log basic environment info
-        _LOGGER.info(f"Python version: {sys.version}")
-        _LOGGER.info(
-            f"OpenSSL version: {getattr(ssl, 'OPENSSL_VERSION', 'Unknown')}"
-            if platform.python_implementation() == "CPython"
-            else "OpenSSL info not available"
-        )
-        _LOGGER.info(f"System: {platform.system()} {platform.release()}")
-        _LOGGER.info(f"Certifi location: {certifi.where()}")
-        _LOGGER.info(f"API URL: {API_URL}")
-
-        # For debugging - enable this if needed
-        # from http.client import HTTPConnection
-        # HTTPConnection.debuglevel = 1
-
-    def _get_circuit_breaker(self, endpoint: str) -> CircuitBreaker:
-        """Get or create circuit breaker for endpoint."""
-        if endpoint not in self.circuit_breakers:
-            self.circuit_breakers[endpoint] = CircuitBreaker()
-        return self.circuit_breakers[endpoint]
-
-    def _classify_error(self, exception: Exception) -> ErrorType:
-        """Classify error type for retry strategy."""
-        if isinstance(exception, requests.exceptions.Timeout):
-            return ErrorType.TIMEOUT
-        elif isinstance(
-            exception,
-            (
-                requests.exceptions.ConnectionError,
-                requests.exceptions.ConnectTimeout,
-                requests.exceptions.ReadTimeout,
-            ),
-        ):
-            return ErrorType.NETWORK
-        elif isinstance(exception, requests.exceptions.HTTPError):
-            return ErrorType.HTTP_ERROR
-        elif isinstance(exception, LoggameraAPIError):
-            if "invalid endpoint" in str(exception).lower():
-                return ErrorType.INVALID_ENDPOINT
-            return ErrorType.API_ERROR
-        else:
-            return ErrorType.NETWORK  # Default to network error for unknown exceptions
-
-    async def _sleep_async(self, delay: int):
-        """Async sleep for retry delays."""
-        await asyncio.sleep(delay)
-
-    def _sleep_sync(self, delay: int):
-        """Sync sleep for retry delays."""
-        time.sleep(delay)
-
-    def _make_request(  # noqa: C901
-        self, endpoint: str, data: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
-        """Make a request to the Loggamera API with retry and circuit breaker.
-
-        Args:
-            endpoint: The API endpoint to call (without leading slash)
-            data: Optional request data dict (ApiKey will be added automatically)
-
-        Returns:
-            Dict containing the API response
-
-        Raises:
-            LoggameraAPIError: If the request fails or returns an error
-        """
-        # Check circuit breaker
-        circuit_breaker = self._get_circuit_breaker(endpoint)
-        if circuit_breaker.is_open():
+    def _make_request(self, endpoint: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """POST to a Loggamera endpoint with retry + per-endpoint circuit breaker."""
+        breaker = self._circuit_breaker(endpoint)
+        if breaker.is_open():
             raise LoggameraAPIError(
-                f"Circuit breaker is open for endpoint {endpoint}. " f"Too many recent failures."
+                f"Circuit breaker is open for endpoint {endpoint}; too many recent failures"
             )
 
         url = f"{API_URL}/{endpoint}"
-        headers = {"Content-Type": "application/json"}
+        payload = {"ApiKey": self.api_key, **(data or {})}
 
-        # Initialize data if not provided
-        if data is None:
-            data = {}
-
-        # Always include the API key
-        if "ApiKey" not in data:
-            data["ApiKey"] = self.api_key
-
-        last_exception = None
-
-        # Retry loop
-        for attempt in range(self.retry_config.max_retries + 1):
+        last_exc: Optional[Exception] = None
+        for attempt in range(MAX_RETRIES + 1):
             try:
-                if attempt > 0:
-                    _LOGGER.debug(f"Retry attempt {attempt} for {endpoint}")
-                else:
-                    _LOGGER.debug(f"Making request to {endpoint}")
-
-                response = self.session.post(url, headers=headers, json=data, timeout=30)
-
-                if response.status_code != 200:
-                    error_msg = f"HTTP error {response.status_code}: {response.text}"
-                    _LOGGER.error(error_msg)
-
-                    # For HTTP errors, determine if retryable
-                    if response.status_code >= 500:  # Server errors are retryable
-                        exception = LoggameraAPIError(error_msg)
-                        last_exception = exception
-                        error_type = self._classify_error(exception)
-                    elif response.status_code == 429:  # Rate limiting
-                        exception = LoggameraAPIError(error_msg)
-                        last_exception = exception
-                        error_type = self._classify_error(exception)
-                    else:  # Client errors (4xx) are not retryable
-                        circuit_breaker.record_failure()
-                        raise LoggameraAPIError(error_msg)
-
-                    # Check if we should retry this HTTP error
-                    if self.retry_config.should_retry(error_type, attempt):
-                        delay = self.retry_config.get_delay(attempt)
-                        _LOGGER.warning(
-                            f"Request to {endpoint} failed (attempt {attempt + 1}): {error_msg}. "
-                            f"Retrying in {delay} seconds... "
-                            f"(HTTP {response.status_code})"
-                        )
-                        self._sleep_sync(delay)
-                        continue
-                    else:
-                        circuit_breaker.record_failure()
-                        raise exception
-                else:
-                    # Parse successful response
-                    try:
-                        # Handle endpoints that return no response body
-                        if not response.text.strip():
-                            result = {"Data": None, "Error": None}
-                        else:
-                            result = response.json()
-                    except ValueError as e:
-                        error_msg = f"Invalid JSON response: {response.text}"
-                        _LOGGER.error(error_msg)
-                        circuit_breaker.record_failure()
-                        raise LoggameraAPIError(error_msg) from e
-
-                    # Check for API errors
-                    if "Error" in result and result["Error"] is not None:
-                        if isinstance(result["Error"], dict) and "Message" in result["Error"]:
-                            error_message = result["Error"]["Message"]
-                            if error_message == "invalid endpoint":
-                                _LOGGER.debug(f"Endpoint {endpoint} is not valid for this device")
-                                self._endpoint_cache[endpoint] = False
-                                circuit_breaker.record_failure()
-                                raise LoggameraAPIError(f"API error: {error_message}")
-                            else:
-                                _LOGGER.error(f"API error: {error_message}")
-                                circuit_breaker.record_failure()
-                                raise LoggameraAPIError(f"API error: {error_message}")
-                        else:
-                            error_msg = f"Unknown API error: {result['Error']}"
-                            _LOGGER.error(error_msg)
-                            circuit_breaker.record_failure()
-                            raise LoggameraAPIError(error_msg)
-
-                    # Success!
-                    circuit_breaker.record_success()
-                    if attempt > 0:
-                        _LOGGER.info(f"Request to {endpoint} succeeded after {attempt} retries")
-                    return result
-
-            except Exception as e:
-                last_exception = e
-                error_type = self._classify_error(e)
-
-                # Check if we should retry
-                if self.retry_config.should_retry(error_type, attempt):
-                    delay = self.retry_config.get_delay(attempt)
+                result = self._attempt_request(url, payload, endpoint)
+            except LoggameraAPIError as exc:
+                last_exc = exc
+                error_type = _classify_error(exc)
+                if error_type in RETRYABLE_ERRORS and attempt < MAX_RETRIES:
+                    delay = BACKOFF_DELAYS[min(attempt, len(BACKOFF_DELAYS) - 1)]
                     _LOGGER.warning(
-                        f"Request to {endpoint} failed (attempt {attempt + 1}): {e}. "
-                        f"Retrying in {delay} seconds... "
-                        f"(Error type: {error_type.value})"
+                        f"{endpoint} failed (attempt {attempt + 1}): {exc}; retrying in {delay}s"
                     )
-                    self._sleep_sync(delay)
+                    time.sleep(delay)
                     continue
-                else:
-                    # No more retries or non-retryable error
-                    circuit_breaker.record_failure()
-                    if error_type in self.retry_config.retryable_errors:
-                        _LOGGER.error(
-                            f"Request to {endpoint} failed after {attempt + 1} attempts: {e}"
-                        )
-                    else:
-                        _LOGGER.error(f"Request to {endpoint} failed with non-retryable error: {e}")
-                    break
+                breaker.record_failure()
+                raise
 
-        # If we get here, all retries failed
-        circuit_breaker.record_failure()
-        if isinstance(last_exception, LoggameraAPIError):
-            raise last_exception
-        else:
-            raise LoggameraAPIError(f"Request failed: {last_exception}") from last_exception
+            breaker.record_success()
+            if attempt > 0:
+                _LOGGER.info(f"{endpoint} succeeded after {attempt} retries")
+            return result
+
+        breaker.record_failure()
+        raise LoggameraAPIError(f"Request failed: {last_exc}") from last_exc
+
+    def _attempt_request(self, url: str, payload: Dict[str, Any], endpoint: str) -> Dict[str, Any]:
+        """Perform a single HTTP attempt and validate the response shape."""
+        try:
+            response = self.session.post(
+                url, headers={"Content-Type": "application/json"}, json=payload, timeout=30
+            )
+        except requests.exceptions.RequestException as exc:
+            raise LoggameraAPIError(f"Network error: {exc}") from exc
+
+        if response.status_code != 200:
+            msg = f"HTTP {response.status_code}: {response.text}"
+            if response.status_code in RETRYABLE_STATUS_CODES:
+                # Caller's retry loop will see this as retryable via _classify_error
+                raise LoggameraAPIError(msg)
+            raise LoggameraAPIError(msg)
+
+        try:
+            result = response.json() if response.text.strip() else {"Data": None, "Error": None}
+        except ValueError as exc:
+            raise LoggameraAPIError(f"Invalid JSON response: {response.text}") from exc
+
+        error = result.get("Error")
+        if error is not None:
+            message = error.get("Message") if isinstance(error, dict) else str(error)
+            if message == "invalid endpoint":
+                self._endpoint_cache[endpoint] = False
+            raise LoggameraAPIError(f"API error: {message}")
+
+        return result
 
     def get_organizations(self) -> Dict[str, Any]:
-        """Get organizations.
-
-        Returns:
-            Dict containing organizations data
-        """
         return self._make_request(API_ENDPOINT_ORGANIZATIONS)
 
     def get_devices(self) -> Dict[str, Any]:
-        """Get devices for the configured organization.
-
-        Returns:
-            Dict containing devices data
-
-        Raises:
-            LoggameraAPIError: If organization_id is not set
-        """
         if not self.organization_id:
-            _LOGGER.error("Organization ID is required for get_devices")
             raise LoggameraAPIError("Organization ID is required for get_devices")
-
         return self._make_request(API_ENDPOINT_DEVICES, {"OrganizationId": self.organization_id})
 
-    def _validate_device_params(self, device_id: Union[str, int], device_type: str) -> int:
-        """Validate and convert device parameters.
+    def get_device_data(self, device_id: Union[str, int], device_type: str) -> Dict[str, Any]:
+        """Fetch device data, preferring the device-type endpoint then falling back."""
+        device_id = self._validate_device_id(device_id)
+        return self._fetch_with_fallbacks(device_id, device_type)
 
-        Args:
-            device_id: Device ID to validate
-            device_type: Device type to validate
+    def get_raw_data(self, device_id: Union[str, int]) -> Dict[str, Any]:
+        device_id = self._validate_device_id(device_id)
+        return self._make_request(API_ENDPOINT_RAW_DATA, {"DeviceId": device_id})
 
-        Returns:
-            Validated device_id as integer
-
-        Raises:
-            LoggameraAPIError: If parameters are invalid
-        """
+    def get_scenarios(self) -> Dict[str, Any]:
+        if not self.organization_id:
+            return {"Data": {"Scenarios": []}, "Error": None}
         try:
-            device_id = int(device_id)
-        except (ValueError, TypeError):
-            _LOGGER.error(f"Invalid device ID: {device_id}")
-            raise LoggameraAPIError(f"Invalid device ID: {device_id}")
+            return self._make_request(
+                API_ENDPOINT_SCENARIOS, {"OrganizationId": self.organization_id}
+            )
+        except LoggameraAPIError as exc:
+            if "invalid endpoint" in str(exc):
+                return {"Data": {"Scenarios": []}, "Error": None}
+            raise
 
-        if not device_type or not isinstance(device_type, str):
-            _LOGGER.error(f"Invalid device type: {device_type}")
-            raise LoggameraAPIError(f"Invalid device type: {device_type}")
+    def execute_scenario_async(
+        self, scenario_id: Union[str, int], duration_minutes: Optional[int] = None
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"ScenarioId": scenario_id}
+        if duration_minutes is not None:
+            payload["DurationMinutes"] = duration_minutes
+        return self._make_request(API_ENDPOINT_EXECUTE_SCENARIO_ASYNC, payload)
 
-        return device_id
+    @staticmethod
+    def _validate_device_id(device_id: Union[str, int]) -> int:
+        try:
+            return int(device_id)
+        except (ValueError, TypeError) as exc:
+            raise LoggameraAPIError(f"Invalid device ID: {device_id}") from exc
 
-    def _has_valid_data(self, response: Dict[str, Any]) -> bool:
-        """Check if API response contains valid data.
+    def _fetch_with_fallbacks(self, device_id: int, device_type: str) -> Dict[str, Any]:
+        """Try the primary endpoint for the device type, then RawData/GenericDevice."""
+        primary = PRIMARY_ENDPOINTS.get(device_type)
+        candidates = [e for e in (primary, *FALLBACK_ENDPOINTS) if e]
 
-        Args:
-            response: API response dictionary
+        for endpoint in candidates:
+            if self._endpoint_cache.get(endpoint) is False:
+                continue
+            try:
+                response = self._make_request(endpoint, {"DeviceId": device_id})
+            except LoggameraAPIError as exc:
+                _LOGGER.debug(f"Endpoint {endpoint} failed for device {device_id}: {exc}")
+                continue
 
-        Returns:
-            True if response contains valid data values
-        """
-        has_data = (
-            "Data" in response
-            and response["Data"] is not None
-            and "Values" in response["Data"]
-            and response["Data"]["Values"]
-        )
+            has_data = self._has_valid_data(response)
+            self._track_data_gap(device_id, has_data, endpoint)
+            if has_data:
+                response["_endpoint_used"] = endpoint
+                return response
 
-        # Enhanced logging for data gap investigation
-        if not has_data:
-            current_time = datetime.now().isoformat()
-            if "Data" not in response:
-                _LOGGER.warning(
-                    f"API response missing 'Data' field at {current_time}. "
-                    f"Full response: {response}"
-                )
-            elif response["Data"] is None:
-                _LOGGER.warning(
-                    f"API returned null 'Data' field at {current_time}. "
-                    f"This may indicate server-side processing issues."
-                )
-            elif "Values" not in response["Data"]:
-                _LOGGER.warning(
-                    f"API response 'Data' missing 'Values' field at {current_time}. "
-                    f"Data structure: {response['Data']}"
-                )
-            elif not response["Data"]["Values"]:
-                _LOGGER.warning(
-                    f"API returned empty 'Values' array at {current_time}. "
-                    f"This indicates a data gap - investigating timing patterns. "
-                    f"Data structure: {response['Data']}"
-                )
+        self._track_data_gap(device_id, False, "all_endpoints_failed")
+        raise LoggameraAPIError(f"All endpoints failed for device {device_id}")
 
-        return has_data
+    @staticmethod
+    def _has_valid_data(response: Dict[str, Any]) -> bool:
+        data = response.get("Data") or {}
+        return bool(data.get("Values"))
 
-    def _track_data_gap(self, device_id: int, has_data: bool, endpoint: str = "unknown") -> None:
-        """Track data gaps for a specific device to enable better reporting.
-
-        Args:
-            device_id: Device ID being tracked
-            has_data: Whether the API returned valid data
-            endpoint: Which endpoint was used for context
-        """
-        current_time = time.time()
-        device_key = str(device_id)
-
-        if device_key not in self._data_gap_tracker:
-            self._data_gap_tracker[device_key] = {
+    def _track_data_gap(self, device_id: int, has_data: bool, endpoint: str) -> None:
+        """Track gap start/end per device for the API health diagnostic sensor."""
+        now = time.time()
+        key = str(device_id)
+        tracker = self._data_gap_tracker.setdefault(
+            key,
+            {
                 "gap_start": None,
                 "gap_count": 0,
-                "last_successful": current_time if has_data else None,
+                "last_successful": now if has_data else None,
                 "consecutive_failures": 0,
                 "endpoint": endpoint,
-            }
-
-        tracker = self._data_gap_tracker[device_key]
+            },
+        )
 
         if has_data:
-            # Data received successfully
             if tracker["gap_start"] is not None:
-                # End of a data gap
-                gap_duration = current_time - tracker["gap_start"]
-                gap_minutes = int(gap_duration / 60)
+                gap_minutes = int((now - tracker["gap_start"]) / 60)
                 _LOGGER.warning(
-                    f"Data gap ended for device {device_id}. "
-                    f"Gap lasted {gap_minutes} minutes "
-                    f"({tracker['consecutive_failures']} failed attempts). "
-                    f"Endpoint: {endpoint}"
+                    f"Data gap ended for device {device_id} after {gap_minutes} minutes "
+                    f"({tracker['consecutive_failures']} failed attempts on {endpoint})"
                 )
                 tracker["gap_start"] = None
                 tracker["consecutive_failures"] = 0
-
-            tracker["last_successful"] = current_time
+            tracker["last_successful"] = now
             tracker["endpoint"] = endpoint
-        else:
-            # No data received
-            tracker["consecutive_failures"] += 1
+            return
 
-            if tracker["gap_start"] is None:
-                # Start of a new data gap
-                tracker["gap_start"] = current_time
-                tracker["gap_count"] += 1
-                _LOGGER.warning(
-                    f"Data gap started for device {device_id} at {datetime.now().isoformat()}. "
-                    f"This is gap #{tracker['gap_count']} for this device. "
-                    f"Endpoint: {endpoint}"
-                )
-            elif tracker["consecutive_failures"] % 5 == 0:
-                # Log every 5th consecutive failure during a gap
-                gap_duration = current_time - tracker["gap_start"]
-                gap_minutes = int(gap_duration / 60)
-                _LOGGER.error(
-                    f"Ongoing data gap for device {device_id}: {gap_minutes} minutes, "
-                    f"{tracker['consecutive_failures']} consecutive failures. "
-                    f"Endpoint: {endpoint}"
-                )
+        tracker["consecutive_failures"] += 1
+        if tracker["gap_start"] is None:
+            tracker["gap_start"] = now
+            tracker["gap_count"] += 1
+            _LOGGER.warning(
+                f"Data gap started for device {device_id} at {datetime.now().isoformat()} "
+                f"(gap #{tracker['gap_count']}, endpoint: {endpoint})"
+            )
+        elif tracker["consecutive_failures"] % 5 == 0:
+            gap_minutes = int((now - tracker["gap_start"]) / 60)
+            _LOGGER.error(
+                f"Ongoing data gap for device {device_id}: {gap_minutes} minutes, "
+                f"{tracker['consecutive_failures']} consecutive failures on {endpoint}"
+            )
 
     def get_data_gap_status(self) -> Dict[str, Any]:
-        """Get current data gap status for all tracked devices.
-
-        Returns:
-            Dictionary with data gap information for monitoring/diagnostics
-        """
-        current_time = time.time()
-        status = {
-            "devices_with_gaps": 0,
-            "total_devices_tracked": len(self._data_gap_tracker),
-            "devices": {},
-        }
+        """Snapshot of gap state, used by the API health binary sensor."""
+        now = time.time()
+        devices: Dict[str, Dict[str, Any]] = {}
+        with_gaps = 0
 
         for device_id, tracker in self._data_gap_tracker.items():
-            device_status = {
+            entry: Dict[str, Any] = {
                 "has_active_gap": tracker["gap_start"] is not None,
                 "total_gaps": tracker["gap_count"],
                 "consecutive_failures": tracker["consecutive_failures"],
                 "last_successful": tracker["last_successful"],
                 "endpoint": tracker.get("endpoint", "unknown"),
             }
-
             if tracker["gap_start"]:
-                device_status["gap_duration_minutes"] = int(
-                    (current_time - tracker["gap_start"]) / 60
-                )
-                status["devices_with_gaps"] += 1
+                entry["gap_duration_minutes"] = int((now - tracker["gap_start"]) / 60)
+                with_gaps += 1
             elif tracker["last_successful"]:
-                device_status["minutes_since_last_success"] = int(
-                    (current_time - tracker["last_successful"]) / 60
-                )
+                entry["minutes_since_last_success"] = int((now - tracker["last_successful"]) / 60)
+            devices[device_id] = entry
 
-            status["devices"][device_id] = device_status
-
-        return status
-
-    def _get_primary_endpoint_for_device(  # noqa: C901
-        self, device_id: int, device_type: str
-    ) -> Dict[str, Any]:
-        """Get data from the primary endpoint for a specific device type.
-
-        Args:
-            device_id: Device ID to fetch data for
-            device_type: Type of device to determine primary endpoint
-
-        Returns:
-            Primary device data response
-
-        Raises:
-            LoggameraAPIError: If primary endpoint fails
-        """
-        # Determine primary endpoint based on device type
-        primary_endpoint = None
-
-        if device_type == "PowerMeter":
-            primary_endpoint = API_ENDPOINT_POWER_METER
-        elif device_type == "RoomSensor":
-            primary_endpoint = API_ENDPOINT_ROOM_SENSOR
-        elif device_type == "WaterMeter":
-            primary_endpoint = API_ENDPOINT_WATER_METER
-        elif device_type == "CoolingUnit":
-            primary_endpoint = API_ENDPOINT_COOLING_UNIT
-        elif device_type == "HeatPump":
-            primary_endpoint = API_ENDPOINT_HEAT_PUMP
-        elif device_type == "HeatMeter":
-            # HeatMeter has no dedicated endpoint - use RawData directly
-            primary_endpoint = None
-
-        # If we have a primary endpoint, try it first
-        if primary_endpoint:
-            try:
-                # Skip if we know this endpoint is invalid
-                if not (
-                    primary_endpoint in self._endpoint_cache
-                    and self._endpoint_cache[primary_endpoint] is False
-                ):
-                    response = self._make_request(primary_endpoint, {"DeviceId": device_id})
-
-                    # Check if this endpoint is invalid
-                    if not (
-                        "Error" in response
-                        and response["Error"]
-                        and isinstance(response["Error"], dict)
-                        and "Message" in response["Error"]
-                        and response["Error"]["Message"] == "invalid endpoint"
-                    ):
-                        # Check if we got valid data
-                        has_data = self._has_valid_data(response)
-                        self._track_data_gap(device_id, has_data, primary_endpoint)
-
-                        if has_data:
-                            # Add endpoint info for debugging/tracking
-                            response["_endpoint_used"] = primary_endpoint
-                            return response
-
-            except LoggameraAPIError as e:
-                _LOGGER.debug(f"Primary endpoint {primary_endpoint} failed: {e}")
-
-        # Fallback to generic endpoints
-        fallback_endpoints = [API_ENDPOINT_RAW_DATA, API_ENDPOINT_GENERIC_DEVICE]
-
-        for endpoint in fallback_endpoints:
-            try:
-                # Skip if we know this endpoint is invalid
-                if endpoint in self._endpoint_cache and self._endpoint_cache[endpoint] is False:
-                    continue
-
-                response = self._make_request(endpoint, {"DeviceId": device_id})
-
-                # Check if this endpoint is invalid
-                if (
-                    "Error" in response
-                    and response["Error"]
-                    and isinstance(response["Error"], dict)
-                    and "Message" in response["Error"]
-                    and response["Error"]["Message"] == "invalid endpoint"
-                ):
-                    continue
-
-                # Check if we got valid data
-                has_data = self._has_valid_data(response)
-                self._track_data_gap(device_id, has_data, endpoint)
-
-                if has_data:
-                    # Add endpoint info for debugging/tracking
-                    response["_endpoint_used"] = endpoint
-                    return response
-
-            except LoggameraAPIError as e:
-                _LOGGER.debug(f"Fallback endpoint {endpoint} failed: {e}")
-                continue
-
-        # If we get here, all endpoints failed
-        self._track_data_gap(device_id, False, "all_endpoints_failed")
-        raise LoggameraAPIError(f"All endpoints failed for device {device_id}")
-
-    def get_device_data(self, device_id: Union[str, int], device_type: str) -> Dict[str, Any]:
-        """Get device data from the primary endpoint for the device type.
-
-        This method gets data from the primary endpoint only (e.g., PowerMeter
-        endpoint for PowerMeter devices). RawData is collected separately via
-        get_raw_data() to provide additional detailed sensors.
-
-        Args:
-            device_id: Device ID to fetch data for
-            device_type: Type of device (PowerMeter, RoomSensor, etc.)
-
-        Returns:
-            Primary device data response
-
-        Raises:
-            LoggameraAPIError: If primary endpoint fails
-        """
-        # Validate input parameters
-        device_id = self._validate_device_params(device_id, device_type)
-
-        # Get data from primary endpoint for this device type
-        return self._get_primary_endpoint_for_device(device_id, device_type)
-
-    def get_raw_data(self, device_id: Union[str, int]) -> Dict[str, Any]:
-        """Get raw device data.
-
-        Args:
-            device_id: Device ID to fetch raw data for
-
-        Returns:
-            Raw device data response
-        """
-        device_id = self._validate_device_params(device_id, "Unknown")
-        return self._make_request(
-            API_ENDPOINT_RAW_DATA,
-            {"DeviceId": device_id},
-        )
-
-    def get_capabilities(self, device_id: Union[str, int]) -> Dict[str, Any]:
-        """Get device capabilities.
-
-        Args:
-            device_id: Device ID to get capabilities for
-
-        Returns:
-            Device capabilities data
-        """
-        device_id = self._validate_device_params(device_id, "Unknown")
-        try:
-            return self._make_request(API_ENDPOINT_CAPABILITIES, {"DeviceId": device_id})
-        except LoggameraAPIError as e:
-            # Don't raise error if endpoint is not available
-            if "invalid endpoint" in str(e):
-                _LOGGER.warning(f"Capabilities endpoint not available for device {device_id}")
-                return {
-                    "Data": {"ReadCapabilities": [], "WriteCapabilities": []},
-                    "Error": None,
-                }
-            else:
-                raise
-
-    def get_scenarios(self) -> Dict[str, Any]:
-        """Get scenarios for the configured organization.
-
-        Returns:
-            Scenarios data
-        """
-        if not self.organization_id:
-            _LOGGER.error("Organization ID is required for get_scenarios")
-            return {"Data": {"Scenarios": []}, "Error": None}
-
-        try:
-            return self._make_request(
-                API_ENDPOINT_SCENARIOS, {"OrganizationId": self.organization_id}
-            )
-        except LoggameraAPIError as e:
-            # Don't raise error if endpoint is not available
-            if "invalid endpoint" in str(e):
-                _LOGGER.warning(
-                    f"Scenarios endpoint not available for organization " f"{self.organization_id}"
-                )
-                return {"Data": {"Scenarios": []}, "Error": None}
-            else:
-                raise
-
-    def execute_scenario_async(
-        self, scenario_id: Union[str, int], duration_minutes: Optional[int] = None
-    ) -> Dict[str, Any]:
-        """Execute a scenario asynchronously.
-
-        Args:
-            scenario_id: ID of scenario to execute
-            duration_minutes: Optional duration in minutes
-
-        Returns:
-            Execution result (typically empty for async endpoints)
-        """
-        data = {"ScenarioId": scenario_id}
-
-        if duration_minutes is not None:
-            data["DurationMinutes"] = duration_minutes
-
-        return self._make_request(API_ENDPOINT_EXECUTE_SCENARIO_ASYNC, data)
-
-    def user_access(self, user_id: Union[str, int]) -> Dict[str, Any]:
-        """Get user access information.
-
-        Args:
-            user_id: User ID to get access info for
-
-        Returns:
-            User access data (typically empty for this endpoint)
-        """
-        data = {"UserId": user_id}
-        return self._make_request(API_ENDPOINT_USER_ACCESS, data)
-
-    # Convenience methods for easier API usage
-
-    def is_endpoint_available(self, endpoint: str) -> bool:
-        """Check if an endpoint is available (cached result).
-
-        Args:
-            endpoint: Endpoint name to check
-
-        Returns:
-            True if endpoint is available, False if cached as unavailable
-        """
-        return self._endpoint_cache.get(endpoint, True)
-
-    def get_all_device_data(self) -> Dict[str, Any]:
-        """Get data for all devices in the organization.
-
-        Returns:
-            Dict mapping device_id -> device_data for all devices
-        """
-        if not self.organization_id:
-            raise LoggameraAPIError("Organization ID is required")
-
-        devices_response = self.get_devices()
-        if not self._has_valid_data(devices_response):
-            return {}
-
-        all_device_data = {}
-        for device in devices_response["Data"]["Values"]:
-            device_id = device["Id"]
-            device_type = device["Class"]
-
-            try:
-                device_data = self.get_device_data(device_id, device_type)
-                all_device_data[str(device_id)] = device_data
-            except LoggameraAPIError as e:
-                _LOGGER.warning(f"Failed to get data for device {device_id}: {e}")
-                continue
-
-        return all_device_data
-
-    def clear_endpoint_cache(self) -> None:
-        """Clear the endpoint availability cache."""
-        self._endpoint_cache.clear()
-        _LOGGER.debug("Endpoint cache cleared")
+        return {
+            "devices_with_gaps": with_gaps,
+            "total_devices_tracked": len(self._data_gap_tracker),
+            "devices": devices,
+        }
