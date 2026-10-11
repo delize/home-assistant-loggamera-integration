@@ -152,15 +152,24 @@ class LoggameraAPIHealthSensor(CoordinatorEntity, BinarySensorEntity):
         self.api = api
 
         # Entity attributes
-        self._attr_unique_id = "loggamera_api_health"
+        # Legacy unique ID is kept for organization entries so existing entities aren't orphaned
+        fixed = coordinator.fixed_device
+        self._attr_unique_id = (
+            f"loggamera_api_health_{fixed['Id']}" if fixed else "loggamera_api_health"
+        )
         self._attr_name = "Loggamera API Health"
         self._attr_device_class = BinarySensorDeviceClass.PROBLEM
         self._attr_icon = "mdi:api"
 
         # Device info for integration
         self._attr_device_info = {
-            "identifiers": {(DOMAIN, "loggamera_integration")},
-            "name": "Loggamera Integration",
+            "identifiers": {
+                (
+                    DOMAIN,
+                    f"loggamera_integration_{fixed['Id']}" if fixed else "loggamera_integration",
+                )
+            },
+            "name": f"Loggamera Integration {fixed['Id']}" if fixed else "Loggamera Integration",
             "manufacturer": "Loggamera",
             "model": "API Client",
         }

@@ -21,6 +21,18 @@ API_ENDPOINT_USER_ACCESS = "UserAccess"
 # Configuration
 CONF_API_KEY = "api_key"
 CONF_ORGANIZATION_ID = "organization_id"
+CONF_DEVICE_ID = "device_id"
+CONF_DEVICE_TYPE = "device_type"
+DEVICE_TYPES = [
+    "HeatPump",
+    "PowerMeter",
+    "RoomSensor",
+    "WaterMeter",
+    "CoolingUnit",
+    "HeatMeter",
+    "ChargingStation",
+]
+DEFAULT_DEVICE_TYPE = "HeatPump"
 CONF_SCAN_INTERVAL = "scan_interval"
 
 # Default 20 minutes (1200 seconds) - optimized for PowerMeter which typically updates every ~30 minutes  # noqa: E501

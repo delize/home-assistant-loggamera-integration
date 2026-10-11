@@ -1,21 +1,24 @@
 {
   "config": {
     "abort": {
-      "already_configured": "This organization is already configured"
+      "already_configured": "This account or device is already configured"
     },
     "error": {
       "cannot_connect": "Failed to connect to Loggamera API",
       "invalid_auth": "Invalid API key",
       "no_organizations": "No organizations found for this API key",
-      "unknown": "Unexpected error"
+      "unknown": "Unexpected error",
+      "wrong_device_type": "The device did not respond as this device type. Check the device type."
     },
     "step": {
       "user": {
         "data": {
           "api_key": "API Key",
+          "device_id": "Device ID (only for device-specific API keys)",
+          "device_type": "Device type (must match the device)",
           "scan_interval": "Update interval (seconds)"
         },
-        "description": "Enter your Loggamera API key to connect to your devices",
+        "description": "Enter your Loggamera API key. If your key only works for a single device, also enter its Device ID and type.",
         "title": "Set up Loggamera Integration"
       }
     }

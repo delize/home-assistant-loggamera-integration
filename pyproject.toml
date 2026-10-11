@@ -36,3 +36,7 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 module = "custom_components.loggamera.*"
 ignore_errors = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

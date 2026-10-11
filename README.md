@@ -21,7 +21,7 @@ Integrate your Loggamera devices with Home Assistant for comprehensive energy mo
 ### Installation
 1. **HACS** → **Integrations** → Search **"Loggamera"** → **Install**
 2. **Settings** → **Devices & Services** → **Add Integration** → **Loggamera**
-3. Enter your **Loggamera API key**
+3. Enter your **Loggamera API key** (for a key limited to one device, also enter its Device ID and type)
 
 ### Supported Devices
 - ⚡ **PowerMeter** - Energy monitoring with HA Energy dashboard integration

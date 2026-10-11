@@ -793,8 +793,8 @@ async def async_setup_entry(  # noqa: C901
                     processed_unique_ids.add(unique_id)
                     _LOGGER.debug(f"Created RawData sensor: {entity.name} (disabled by default)")
 
-    # Create organization-level sensors
-    if coordinator.data.get("devices"):
+    # Create organization-level sensors (not for device-scoped keys: no organization data)
+    if coordinator.data.get("devices") and not coordinator.fixed_device:
         device_count = len(coordinator.data["devices"])
         organization_name = (
             f"Organization {api.organization_id}"
